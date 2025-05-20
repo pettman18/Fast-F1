@@ -1,97 +1,148 @@
 """Qualifying results overview
-==============================
+=============================
 
-Plot the qualifying result with visualization the fastest times.
+Compare fastest laps from practice and qualifying sessions across the
+2024 season and evaluate which session best predicts the final race
+result.
 """
 
+from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from scipy.stats import spearmanr
 from timple.timedelta import strftimedelta
 
 import fastf1
 import fastf1.plotting
 from fastf1.core import Laps
 
+fastf1.Cache.enable_cache("./.fastf1cache")
 
 # Enable Matplotlib patches for plotting timedelta values
-fastf1.plotting.setup_mpl(mpl_timedelta_support=True, misc_mpl_mods=False,
-                          color_scheme=None)
+fastf1.plotting.setup_mpl(
+    mpl_timedelta_support=True,
+    misc_mpl_mods=False,
+    color_scheme=None,
+)
+
+SEASON = 2024
+SESSIONS_TO_COMPARE = ["FP1", "FP2", "FP3", "Q"]
 
 
-session = fastf1.get_session(2021, 'Spanish Grand Prix', 'Q')
-session.load()
+def fastest_lap_info(session: fastf1.core.Session) -> tuple[Laps, pd.Series, list[str]]:
+    """Return fastest laps and pole information for plotting."""
+    drivers = pd.unique(session.laps["Driver"])
+    list_fastest_laps = [
+        session.laps.pick_drivers(drv).pick_fastest() for drv in drivers
+    ]
+    fastest_laps = (
+        Laps(list_fastest_laps).sort_values(by="LapTime").reset_index(drop=True)
+    )
+    pole_lap = fastest_laps.pick_fastest()
+    fastest_laps["LapTimeDelta"] = fastest_laps["LapTime"] - pole_lap["LapTime"]
+    team_colors = [
+        fastf1.plotting.get_team_color(lap["Team"], session=session)
+        for _, lap in fastest_laps.iterlaps()
+    ]
+    return fastest_laps, pole_lap, team_colors
 
 
-##############################################################################
-# First, we need to get an array of all drivers.
+def plot_session(session: fastf1.core.Session) -> None:
+    """Plot fastest lap times of one session."""
+    fastest_laps, pole_lap, team_colors = fastest_lap_info(session)
 
-drivers = pd.unique(session.laps['Driver'])
-print(drivers)
+    fig, ax = plt.subplots()
+    ax.barh(
+        fastest_laps.index,
+        fastest_laps["LapTimeDelta"],
+        color=team_colors,
+        edgecolor="grey",
+    )
+    ax.set_yticks(fastest_laps.index)
+    ax.set_yticklabels(fastest_laps["Driver"])
 
+    ax.invert_yaxis()  # show fastest at the top
+    ax.set_axisbelow(True)
+    ax.xaxis.grid(True, which="major", linestyle="--", color="black", zorder=-1000)
 
-##############################################################################
-# After that we'll get each driver's fastest lap, create a new laps object
-# from these laps, sort them by lap time and have pandas reindex them to
-# number them nicely by starting position.
-
-list_fastest_laps = list()
-for drv in drivers:
-    drvs_fastest_lap = session.laps.pick_drivers(drv).pick_fastest()
-    list_fastest_laps.append(drvs_fastest_lap)
-fastest_laps = Laps(list_fastest_laps) \
-    .sort_values(by='LapTime') \
-    .reset_index(drop=True)
-
-
-##############################################################################
-# The plot is nicer to look at and more easily understandable if we just plot
-# the time differences. Therefore, we subtract the fastest lap time from all
-# other lap times.
-
-pole_lap = fastest_laps.pick_fastest()
-fastest_laps['LapTimeDelta'] = fastest_laps['LapTime'] - pole_lap['LapTime']
+    lap_time_string = strftimedelta(pole_lap["LapTime"], "%m:%s.%ms")
+    plt.suptitle(
+        f"{session.event['EventName']} {session.event.year} {session.name}\n"
+        f"Fastest Lap: {lap_time_string} ({pole_lap['Driver']})"
+    )
+    plt.show()
 
 
-##############################################################################
-# We can take a quick look at the laps we have to check if everything
-# looks all right. For this, we'll just check the 'Driver', 'LapTime'
-# and 'LapTimeDelta' columns.
-
-print(fastest_laps[['Driver', 'LapTime', 'LapTimeDelta']])
-
-
-##############################################################################
-# Finally, we'll create a list of team colors per lap to color our plot.
-team_colors = list()
-for index, lap in fastest_laps.iterlaps():
-    color = fastf1.plotting.get_team_color(lap['Team'], session=session)
-    team_colors.append(color)
+def session_result_order(session: fastf1.core.Session) -> pd.Index:
+    """Return driver order by fastest lap."""
+    session.load(laps=True, telemetry=False, weather=False, messages=False)
+    fastest = session.laps.pick_fastest("Driver")
+    return fastest.set_index("Driver")["LapTime"].sort_values().index
 
 
-##############################################################################
-# Now, we can plot all the data
-fig, ax = plt.subplots()
-ax.barh(fastest_laps.index, fastest_laps['LapTimeDelta'],
-        color=team_colors, edgecolor='grey')
-ax.set_yticks(fastest_laps.index)
-ax.set_yticklabels(fastest_laps['Driver'])
-
-# show fastest at the top
-ax.invert_yaxis()
-
-# draw vertical lines behind the bars
-ax.set_axisbelow(True)
-ax.xaxis.grid(True, which='major', linestyle='--', color='black', zorder=-1000)
-# sphinx_gallery_defer_figures
+def race_result_order(session: fastf1.core.Session) -> pd.Index:
+    """Return finishing order of a race."""
+    session.load(laps=False, telemetry=False, weather=False, messages=False)
+    return session.results.sort_values("Position")["Abbreviation"].reset_index(
+        drop=True
+    )
 
 
-##############################################################################
-# Finally, give the plot a meaningful title
+def evaluate_event(event: pd.Series) -> pd.DataFrame:
+    """Calculate correlation coefficients for one race weekend."""
+    race = fastf1.get_session(SEASON, event["EventName"], "R")
+    race_order = race_result_order(race)
 
-lap_time_string = strftimedelta(pole_lap['LapTime'], '%m:%s.%ms')
+    data = []
+    for name in SESSIONS_TO_COMPARE:
+        try:
+            sess = fastf1.get_session(SEASON, event["EventName"], name)
+            order = session_result_order(sess)
+        except Exception as exc:  # pragma: no cover - data may be missing
+            print(f"Skipping {name} for {event['EventName']}: {exc}")
+            continue
 
-plt.suptitle(f"{session.event['EventName']} {session.event.year} Qualifying\n"
-             f"Fastest Lap: {lap_time_string} ({pole_lap['Driver']})")
+        common = race_order[race_order.isin(order)]
+        prac_idx = order.get_indexer(common)
+        race_idx = range(len(common))
+        corr, _ = spearmanr(prac_idx, race_idx)
+        data.append({"session": name, "correlation": corr})
 
-plt.show()
+    return pd.DataFrame(data)
+
+
+def main() -> None:
+    schedule = fastf1.get_event_schedule(SEASON)
+
+    # Plot an example for the first event
+    first_event = schedule.iloc[0]["EventName"]
+    for sess_name in SESSIONS_TO_COMPARE:
+        sess = fastf1.get_session(SEASON, first_event, sess_name)
+        sess.load()
+        plot_session(sess)
+
+    # Evaluate predictive value for the full season
+    result_list = []
+    for rnd in range(1, 25):
+        ev = schedule[schedule["RoundNumber"] == rnd]
+        if ev.empty:
+            print(f"Round {rnd} not found in schedule")
+            continue
+        ev = ev.iloc[0]
+        print(f"Processing {ev['EventName']}")
+        res = evaluate_event(ev)
+        res.insert(0, "Event", ev["EventName"])
+        result_list.append(res)
+
+    season_results = pd.concat(result_list, ignore_index=True)
+    avg = season_results.groupby("session").mean(numeric_only=True)
+    print(season_results)
+    print("\nAverage correlations:\n", avg)
+
+    best = avg["correlation"].idxmax()
+    print(f"\nSession most predictive overall: {best}")
+
+
+if __name__ == "__main__":
+    main()
